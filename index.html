@@ -128,6 +128,12 @@
                     <span data-i18n="btnBackup">Backup/JSON</span>
                 </button>
 
+                <!-- Restore Backup Button -->
+                <button onclick="document.getElementById('backupFileInput').click()" class="px-3 py-2 text-xs font-bold bg-violet-600 hover:bg-violet-500 text-white rounded-xl shadow-md transition-all flex items-center gap-1.5 active:scale-95">
+                    <i class="fa-solid fa-upload"></i>
+                    <span data-i18n="btnRestoreBackup">Restaurar Backup</span>
+                </button>
+
                 <!-- Export CSV Button -->
                 <button onclick="exportData()" class="px-3 py-2 text-xs font-bold bg-teal-600 hover:bg-teal-500 text-white rounded-xl shadow-md transition-all flex items-center gap-1.5 btn-glow-teal active:scale-95">
                     <i class="fa-solid fa-file-excel"></i>
@@ -605,7 +611,8 @@
             pt: {
                 btnPrint: 'Imprimir Ponto',
                 btnSettings: 'Configurações',
-                btnBackup: 'Backup/JSON',
+                btnBackup: 'Exportar Backup',
+                btnRestoreBackup: 'Restaurar Backup',
                 btnCurrentMonth: 'Mês Atual',
                 badgeNormalRate: 'Hora Normal:',
                 badgeOtRate: 'Hora Extra (+25%):',
@@ -661,7 +668,8 @@
             en: {
                 btnPrint: 'Print Timecard',
                 btnSettings: 'Settings',
-                btnBackup: 'Backup/JSON',
+                btnBackup: 'Export Backup',
+                btnRestoreBackup: 'Restore Backup',
                 btnCurrentMonth: 'Current Month',
                 badgeNormalRate: 'Base Rate:',
                 badgeOtRate: 'Overtime (+25%):',
@@ -1094,7 +1102,7 @@
                                 ${log.startTime} - ${log.endTime}
                             </span>
                             ${log.isHoliday ? '<span class="ml-1 text-[10px] font-bold text-amber-700 bg-amber-100 px-1.5 py-0.5 rounded">Folga</span>' : ''}
-                            ${log.notes ? `<div class="text-[10px] font-medium text-slate-400 mt-0.5"><i class="fa-regular fa-comment mr-1"></i>${log.notes}</div>` : ''}
+                            ${log.notes ? `<div class="text-[10px] font-medium text-slate-400 mt-0.5"><i class="fa-regular fa-comment mr-1"></i>${escapeHtml(log.notes)}</div>` : ''}
                         </td>
                         <td class="p-3 font-black text-slate-800">
                             ${formatMinutes(calc.totalMins)}
@@ -1175,6 +1183,16 @@
             return new Intl.NumberFormat('ja-JP').format(num);
         }
 
+        function escapeHtml(value) {
+            return String(value).replace(/[&<>"']/g, character => ({
+                '&': '&amp;',
+                '<': '&lt;',
+                '>': '&gt;',
+                '"': '&quot;',
+                "'": '&#39;'
+            })[character]);
+        }
+
         function formatMinutes(totalMins) {
             const h = Math.floor(totalMins / 60);
             const m = totalMins % 60;
@@ -1248,19 +1266,75 @@
             reader.onload = function(e) {
                 try {
                     const imported = JSON.parse(e.target.result);
-                    if (imported.logs && Array.isArray(imported.logs)) {
-                        logs = imported.logs;
-                        if (imported.settings) settings = { ...settings, ...imported.settings };
-                        saveLogsToStorage();
-                        saveSettings();
-                        renderApp();
-                        showToast("Backup restaurado com sucesso!", "emerald");
-                    } else {
-                        showToast("Arquivo de backup inválido!", "rose");
+                    if (!imported || !Array.isArray(imported.logs)) {
+                        throw new Error("Backup inválido");
                     }
+
+                    const importedLogs = imported.logs.map(log => {
+                        if (!log || typeof log !== 'object' ||
+                            typeof log.id !== 'string' || !/^[\w-]+$/.test(log.id) ||
+                            typeof log.date !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(log.date) ||
+                            !['startTime', 'endTime'].every(key => typeof log[key] === 'string' && /^([01]\d|2[0-3]):[0-5]\d$/.test(log[key])) ||
+                            (log.notes != null && typeof log.notes !== 'string')) {
+                            throw new Error("Registro inválido no backup");
+                        }
+
+                        const breakNormal = log.breakNormal == null ? 0 : Number(log.breakNormal);
+                        const breakOt = log.breakOt == null ? 0 : Number(log.breakOt);
+                        if (!Number.isInteger(breakNormal) || breakNormal < 0 ||
+                            !Number.isInteger(breakOt) || breakOt < 0) {
+                            throw new Error("Intervalo inválido no backup");
+                        }
+
+                        return {
+                            ...log,
+                            breakNormal,
+                            breakOt,
+                            isHoliday: Boolean(log.isHoliday),
+                            notes: log.notes || ''
+                        };
+                    });
+
+                    const importedSettings = { ...settings };
+                    if (imported.settings != null) {
+                        if (typeof imported.settings !== 'object' || Array.isArray(imported.settings)) {
+                            throw new Error("Configurações inválidas no backup");
+                        }
+                        for (const [key, value] of Object.entries(imported.settings)) {
+                            if (Object.prototype.hasOwnProperty.call(importedSettings, key)) {
+                                const number = Number(value);
+                                if (!Number.isFinite(number) || number < 0 ||
+                                    (key === 'deductionPercent' && number > 100)) {
+                                    throw new Error("Configuração inválida no backup");
+                                }
+                                importedSettings[key] = number;
+                            }
+                        }
+                    }
+
+                    if (!confirm(currentLang === 'pt'
+                        ? 'Restaurar este backup substituirá todos os registros e configurações atuais. Deseja continuar?'
+                        : 'Restoring this backup will replace all current logs and settings. Continue?')) {
+                        return;
+                    }
+
+                    localStorage.setItem(STORAGE_KEY_LOGS, JSON.stringify(importedLogs));
+                    localStorage.setItem(STORAGE_KEY_SETTINGS, JSON.stringify(importedSettings));
+                    logs = importedLogs;
+                    settings = importedSettings;
+                    updateSettingsUI();
+                    updateLiveCalculation();
+                    renderApp();
+                    showToast(currentLang === 'pt' ? "Backup restaurado com sucesso!" : "Backup restored successfully!", "emerald");
                 } catch (err) {
-                    showToast("Erro ao ler o arquivo JSON!", "rose");
+                    showToast(currentLang === 'pt' ? "Backup inválido ou não foi possível restaurá-lo." : "Invalid backup or unable to restore it.", "rose");
+                } finally {
+                    event.target.value = '';
                 }
+            };
+            reader.onerror = function() {
+                event.target.value = '';
+                showToast(currentLang === 'pt' ? "Não foi possível ler o arquivo de backup." : "Could not read the backup file.", "rose");
             };
             reader.readAsText(file);
         }
